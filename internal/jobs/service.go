@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,7 @@ type Service struct {
 	workers   int
 	processor Processor
 	stopping  atomic.Bool
+	stopOnce  sync.Once
 	wg        sync.WaitGroup
 	sequence  atomic.Uint64
 }
@@ -84,15 +86,17 @@ func defaultProcessor(ctx context.Context, payload string) error {
 }
 
 func containsFail(s string) bool {
-	for i := 0; i+4 <= len(s); i++ {
-		if s[i:i+4] == "fail" {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(s, "fail")
 }
 
 func (s *Service) Create(ctx context.Context, payload string) (*Job, error) {
+	if strings.TrimSpace(payload) == "" {
+		return nil, errors.New("payload is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.stopping.Load() {
 		return nil, errors.New("service is stopping")
 	}
@@ -105,19 +109,19 @@ func (s *Service) Create(ctx context.Context, payload string) (*Job, error) {
 		CreatedAt: time.Now().UTC(),
 	}
 
-	s.mu.Lock()
-	s.jobs[id] = job
-	s.mu.Unlock()
+	if _, exists := s.jobs[id]; exists {
+		return nil, errors.New("job already exists")
+	}
 
+	s.jobs[id] = job
 	select {
 	case s.queue <- id:
 		return cloneJob(job), nil
 	case <-ctx.Done():
-		s.mu.Lock()
 		delete(s.jobs, id)
-		s.mu.Unlock()
 		return nil, ctx.Err()
 	default:
+		delete(s.jobs, id)
 		return nil, errors.New("job queue is full")
 	}
 }
@@ -129,7 +133,8 @@ func (s *Service) Get(id string) (*Job, bool) {
 	if !ok {
 		return nil, false
 	}
-	return cloneJob(job), true
+	copy := *job
+	return &copy, true
 }
 
 func (s *Service) worker() {
@@ -140,32 +145,42 @@ func (s *Service) worker() {
 }
 
 func (s *Service) process(id string) {
-	s.mu.Lock()
+	s.mu.RLock()
 	job, ok := s.jobs[id]
 	if !ok {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return
 	}
-	job.Status = StatusProcessing
+	payload := job.Payload
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	if current, ok := s.jobs[id]; ok {
+		current.Status = StatusProcessing
+		current.Error = ""
+	}
 	s.mu.Unlock()
 
-	err := s.processor.Process(context.Background(), job.Payload)
+	err := s.processor.Process(context.Background(), payload)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err != nil {
-		job.Status = StatusFailed
-		job.Error = err.Error()
-		return
+	if current, ok := s.jobs[id]; ok {
+		if err != nil {
+			current.Status = StatusFailed
+			current.Error = err.Error()
+			return
+		}
+		current.Status = StatusCompleted
+		current.Error = ""
 	}
-	job.Status = StatusCompleted
 }
 
 func (s *Service) Stop() {
-	if s.stopping.Swap(true) {
-		return
-	}
-	close(s.queue)
+	s.stopOnce.Do(func() {
+		s.stopping.Store(true)
+		close(s.queue)
+	})
 	s.wg.Wait()
 }
 

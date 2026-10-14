@@ -48,6 +48,27 @@ func TestFailedJob(t *testing.T) {
 	t.Fatal("job did not fail")
 }
 
+func TestCreateRejectsEmptyPayload(t *testing.T) {
+	s := NewService(1, 4)
+	defer s.Stop()
+
+	if _, err := s.Create(context.Background(), "   "); err == nil {
+		t.Fatal("expected empty payload rejection")
+	}
+}
+
+func TestQueueFullRejects(t *testing.T) {
+	s := NewService(1, 1)
+	defer s.Stop()
+
+	if _, err := s.Create(context.Background(), "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(context.Background(), "second"); err == nil {
+		t.Fatal("expected queue full rejection")
+	}
+}
+
 func TestConcurrentCreate(t *testing.T) {
 	s := NewService(4, 100)
 	defer s.Stop()
